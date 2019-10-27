@@ -1,0 +1,354 @@
+#!/usr/bin/env python
+
+"LiDAR Odometry"
+
+from __future__ import division, print_function, unicode_literals
+
+import sys
+import logging
+from os import environ
+from itertools import cycle
+from contextlib import contextmanager
+from timeit import default_timer
+
+import logcolor
+import numpy as np
+from matplotlib import pyplot as plt, cm
+from scipy.spatial.distance import cdist
+
+
+log = logging.getLogger('lidar_odom')
+
+
+@contextmanager
+def timed_code(name=None):
+    next_unit = iter(("s", "ms", "ns", "us")).next
+    msg = "section %s took" % (name,) if name else "section took"
+    t0 = default_timer()
+    try:
+        yield msg
+    finally:
+        delta = default_timer() - t0
+        unit = next_unit()
+        while delta < 1:
+            delta *= 1000.0
+            try:
+                unit = next_unit()
+            except StopIteration:
+                break
+        log.info("%s: %.2f%s" % (msg, delta, unit))
+
+
+def plot2d(X, *a, **k):
+    plt.plot(X[:, 0], X[:, 1], *a, **k)
+
+
+def best_fit_transform(A, B):
+    # translate points to their centroids
+    centroid_A = np.mean(A, axis=0)
+    centroid_B = np.mean(B, axis=0)
+    AA = A - centroid_A
+    BB = B - centroid_B
+
+    # rotation matrix
+    H = np.dot(AA.T, BB)
+    U, S, Vt = np.linalg.svd(H)
+    R = np.dot(Vt.T, U.T)
+
+    if np.linalg.det(R) < 0:
+        Vt[-1,:] *= -1
+        R = np.dot(Vt.T, U.T)
+    t = centroid_B.T - np.dot(R,centroid_A.T)
+
+    # homogeneous transformation
+    T = np.eye(3)
+    T[0:2, 0:2] = R
+    T[0:2, 2] = t
+
+    return T
+
+
+def icp(A, B, max_iterations=75, tolerance=5e-3, convergence=1e-5,
+        max_dist=20e-2, num_sample=30, show_plots=False):
+    # make points homogeneous, copy them so as to maintain the originals
+    src = np.ones((3,A.shape[0]))
+    dst = np.ones((3,B.shape[0]))
+    src[0:2,:] = A.T
+    dst[0:2,:] = B.T
+
+    T = np.eye(3)
+    n = len(A)
+    num_sample = min(n, num_sample)
+    mean_error = np.inf
+    prev_error = mean_error
+    #show_plots = np.random.choice(2, p=(0.9, 0.1))
+
+    sample = np.random.choice(n, num_sample, replace=False)
+    all_dists = cdist(src[0:2, sample].T, dst[0:2, :].T, 'euclidean')
+    # indices[i] is the index of the closest point to sample[i]
+    indices = all_dists.argmin(axis=1)
+    distances = all_dists[np.arange(all_dists.shape[0]), indices]
+
+    for i in range(max_iterations):
+        # find the nearest neighbours between the current source and destination points
+        matched, = np.nonzero(distances < max_dist)
+
+        if show_plots:
+            plot2d(src[0:2, :].T, '*-'); plot2d(dst[0:2, :].T, '*-')
+            for i, j in zip(sample, indices):
+                plot2d(np.array([src[0:2, i], dst[0:2, j]]))
+            plt.show()
+
+        # check error
+        prev_error, mean_error = mean_error, distances[matched].mean()
+        if mean_error < tolerance or np.abs(prev_error - mean_error) < convergence:
+            break
+
+        # compute the transformation between the current source and nearest destination points
+        Ti = best_fit_transform(src[0:2, sample].T, dst[0:2, indices].T)
+
+        # update the current source
+        src = Ti.dot(src)
+        T = Ti.dot(T)
+
+        sample = np.random.choice(n, num_sample, replace=False)
+        all_dists = cdist(src[0:2, sample].T, dst[0:2, :].T, 'euclidean')
+        indices = all_dists.argmin(axis=1)
+        distances = all_dists[np.arange(all_dists.shape[0]), indices]
+
+    if i + 1 == max_iterations:
+        log.warn('icp non-convergence')
+        log.info('mean error: %.5g (prev: %.5g)', mean_error, prev_error)
+
+    if show_plots:
+        plot2d(src[0:2, :].T)
+        plot2d(dst[0:2, :].T)
+        plt.show()
+
+    R = T[0:2, 0:2]
+    t = T[0:2, 2]
+
+    return R, t, mean_error
+
+
+class LidarOdom(object):
+    """ICP-based LiDAR Odometry
+
+    Each position estimate is calculated as the mean of rigid-body transfrom
+    from the last T LiDAR readings to the current reading. More precisely,
+    given a set of LiDAR observations {x_t}_{t=0}^T,
+
+    1. Calculate rigid-body transforms from x_t to x_T as rotation matrices
+       {R^T_t} and translation vectors {v^T_t} using ICP. Note that the
+       transformation is seen as first a translation, and then a rotation.
+
+    2. Let S_T be the rotation at time T, which is the mean of {R^T_t S_t}.
+
+    3. Let w^T_t be the position at T as predicted from the t'th observation,
+
+         w^T_t = p_t + S^t v^T_t,
+
+       where p_t is the position at time t. The justification for this is that
+       the translation must be done in the heading of the previous pose, namely
+       S_t.
+
+    4. The position p_T is then simply the mean of {w^T_t}.
+
+    """
+
+    min_num_hits = 10
+    skip_latest = 0
+
+    # How to calibrate: run in a straight line and determine angle of error.
+    # The resulting odometry should be straight but not aligned with the axis.
+    #angular_offset = 0.0969
+    angular_offset = 0.1454
+
+    # How to calibrate: rotate on the spot determine radius of error. The
+    # resulting odometry should be a circle, whereas you'd expect a point.
+    #cartesian_offset = -0.067, 0.0128
+    cartesian_offset = 0.0, 0.06
+
+    angle_increment = 2*np.pi/360.0
+    angle_min = -np.pi + angle_increment
+    angle_max = +np.pi
+
+    def __init__(self, limit=5, average=2):
+        self.limit = int(limit)
+        self.average = int(average)
+        self._readings = []
+        self._last_icp_trans = np.eye(2), np.r_[0, 0]
+
+    def update(self, s, r, angle_min=angle_min, angle_max=angle_max, angle_increment=angle_increment):
+        idx, = np.nonzero((r != np.inf)*(r > 0.2))
+        n = len(idx)
+        if n < self.min_num_hits:
+            log.warn('ignoring reading: too few hits %d', n)
+            return
+
+        a = np.linspace(angle_min, angle_max, 360, endpoint=True) + self.angular_offset
+        u = np.c_[np.cos(a[idx]), np.sin(a[idx])]
+        xT = (r[idx]*(u.T)).T
+
+        #dcnorm = np.linalg.norm(np.diff(coords, axis=0), axis=1)
+        #coords = coords[dcnorm < 3e-2]
+
+        Rs = np.zeros((2, 2, 0))
+        ws = np.zeros((0, 2))
+        errs = []
+        n = len(self._readings)
+        for t, (st, xt, St, pt) in enumerate(self._readings[:n-self.skip_latest]):
+            Rt, vt, err = icp(xt, xT)
+            #print(t, vt, err)
+            if err > 0.1:
+                continue
+            Rs = np.dstack((Rs, Rt.dot(St)))
+            #ws = np.vstack((ws, pt + (Rt.dot(St)).dot(vt)))
+            ws = np.vstack((ws, pt + St.dot(vt)))
+            errs.append(err)
+
+        if errs:
+            ts = np.argsort(errs)[:self.average]
+            ST = np.mean(Rs[:, :, ts], axis=2)
+            ST /= np.sqrt(np.sum(ST[:, 0]**2))
+            pT = np.mean(ws[ts, :], axis=0)
+            log.info('errors: %s (mean=%.3g)', np.r_[errs][ts], np.mean(errs))
+            if False and np.linalg.norm(pt - pT) > 0.1:
+                B = (xT - pT).dot(ST)
+                plot2d(B)
+                for t in ts:
+                    _, xt, St, pt = self._readings[t]
+                    A = (xt - pt).dot(St)
+                    all_dists = cdist(A, B, 'euclidean')
+                    indices = all_dists.argmin(axis=1)
+                    distances = all_dists[np.arange(all_dists.shape[0]), indices]
+                    mean_error = distances.mean()
+                    print(t, mean_error)
+                    plot2d(A)
+                plt.show()
+        else:
+            if n > self.skip_latest:
+                log.error('no matches, resetting')
+                self._readings = []
+            ST = np.eye(2)
+            pT = np.r_[0, 0]
+
+        assert np.isclose(np.linalg.det(ST), 1)
+
+        log.debug('s_T: %s', s)
+        log.debug('p_T: %s', pT)
+        log.debug('S_T:\n%s', ST)
+
+        self._readings.append((s, xT, ST, pT))
+        self._readings = self._readings[-self.limit:]
+
+    @property
+    def pose(self):
+        s, x, S, lp = self._readings[-1]
+        p = lp - S.dot(self.cartesian_offset)
+        return s, p, np.pi/2 + np.arctan2(S[1,0], S[0,0])
+
+    @property
+    def twist(self):
+        (s0, x0, S0, p0), (s1, x1, S1, p1) = self._readings[-2:]
+        ds, dp, dS = (s1 - s0).to_sec(), p1 - p0, S1 - S0
+        return ds, dp, np.arctan2(S0[1,0], S0[0,0]) - np.arctan2(S1[1,0], S1[0,0])
+
+
+def read_ros(lo):
+    import rospy, tf
+    from sensor_msgs.msg import LaserScan
+    from geometry_msgs.msg import Quaternion, TwistStamped, Vector3, Point
+    from nav_msgs.msg import Odometry
+    rospy.init_node('lidar_odom', anonymous=True)
+    logcolor.basic_config(level=logging.INFO)
+    odom_pub = rospy.Publisher('/odom/lidar', Odometry, queue_size=10)
+    odom_msg = Odometry()
+    odom_msg.header.frame_id = b'odom'
+    odom_msg.child_frame_id = b'base'
+    poses = []
+    def cb(msg):
+        t = msg.header.stamp
+        r = np.array(msg.ranges, dtype=np.float64)
+        lo.update(t, r,
+                  angle_min=msg.angle_min,
+                  angle_max=msg.angle_max,
+                  angle_increment=msg.angle_increment)
+
+        s, (x, y), theta = lo.pose
+        quat = tf.transformations.quaternion_from_euler(0, 0, theta)
+        odom_msg.pose.pose.position = Point(x, y, 0)
+        odom_msg.pose.pose.orientation = Quaternion(*quat)
+
+        dt, (dx, dy), dtheta = lo.twist
+        odom_msg.twist.twist.linear = Vector3(dx/dt, dy/dt, 0)
+        odom_msg.twist.twist.angular.z = dtheta/dt
+
+        odom_msg.header.stamp = t #rospy.Time.now()
+        odom_pub.publish(odom_msg)
+        poses.append(np.r_[x, y, theta])
+
+        log.info('odom: %s, %s, %s', -y, -x, theta)
+
+    sub = rospy.Subscriber('/scan', LaserScan, cb, queue_size=1)
+    rospy.spin()
+
+    return poses
+
+
+def read_npy(lo, fn):
+    poses = []
+    for i, row in enumerate(np.load(sys.argv[1])):
+        #if not (0 <= i < 40): continue
+        #if not (70 <= i < 131): continue
+        #if not (220 <= i < 260): continue
+        p, theta = lo.update(row[0], row[1:])
+        poses.append(np.r_[p, theta])
+        log.info('odom: %s, %s', p, theta)
+    return poses
+
+
+def read_bag(lo, fn):
+    from rosbag.bag import Bag
+    poses = []
+    for bmsg in Bag(fn):
+        msg = bmsg.message
+        t = msg.header.stamp
+        r = np.array(msg.ranges, dtype=np.float64)
+        with timed_code('update'):
+            lo.update(t, r,
+                      angle_min=msg.angle_min,
+                      angle_max=msg.angle_max,
+                      angle_increment=msg.angle_increment)
+        s, (x, y), theta = lo.pose
+        poses.append((x, y, theta))
+    return poses
+
+
+def main(args=sys.argv[1:]):
+    logcolor.basic_config(level=logging.INFO)
+    lo = LidarOdom(limit=3, average=1)
+    a = np.linspace(-np.pi, +np.pi, 360, endpoint=True)
+    args = [a for a in args if ':=' not in a and not a.startswith('_')]
+    if args:
+        for arg in args:
+            log.info('reading %s', arg)
+            f = read_npy if arg.endswith('.npy') else read_bag
+            poses = f(lo, arg)
+    else:
+        log.info('reading from ros')
+        poses = read_ros(lo)
+
+    if 0:
+        poses = np.array(poses)
+        #print(np.diff(poses, axis=0))
+        plot2d(poses, 'k-*')
+        rs = np.r_[0, 0.01][:, np.newaxis]
+        for x, y, theta in poses:
+            plot2d((np.cos(theta), np.sin(theta))*rs + (x, y))
+        plt.axis('equal')
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

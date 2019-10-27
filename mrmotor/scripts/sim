@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+
+
+import sys
+import logging
+import logcolor
+
+import rospy
+import numpy as np
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist, PoseStamped, Quaternion
+from nav_msgs.msg import Odometry
+from tf.transformations import quaternion_from_euler
+
+from matplotlib import pyplot as plt
+
+
+log = logging.getLogger('sim')
+control_frequency = 125 # Hz
+lidar_frequency = 13
+lidar_angular_offset = 0.010*np.pi
+lidar_cartesian_offset = np.r_[-0.11, -0.0128]
+sigma2_lidar = np.array([[0.001, 0, 0],
+                         [0.001, 0, 0],
+                         [0.002, 0, 0.05]])
+sigma2_lidar_r = 0.001
+sigma2_encoder = np.array([[1e-8, 0.001, 0.003],
+                           [1e-8, 0.003, 0.001]])
+
+perp = np.array([(0, -1),
+                 (+1, 0)])
+angle_increment = 2*np.pi/360.0
+angle_min = -np.pi + angle_increment
+angle_max = +np.pi
+scan_time = 0.000137758921483
+range_min = 0.15000000596
+range_max = 6.0
+a = np.arange(angle_min, angle_max + angle_increment, angle_increment) - 1.468*np.pi
+R = np.array([(+np.cos(a), -np.sin(a)),
+              (+np.sin(a), +np.cos(a))])
+
+
+def simulate_lidar(lines, x, y, theta):
+    lines_trans = lines.copy()
+    lines_trans[(0, 2), :] -= x
+    lines_trans[(1, 3), :] -= y
+
+    lines_rot = np.zeros(lines_trans.shape)
+    Rtheta = np.array([(+np.cos(-theta), -np.sin(-theta)),
+                       (+np.sin(-theta), +np.cos(-theta))])
+    np.dot(Rtheta, lines_trans[0:2, :], out=lines_rot[0:2, :])
+    np.dot(Rtheta, lines_trans[2:4, :], out=lines_rot[2:4, :])
+
+    #plt.plot(lines_trans[(0,2), :], lines_trans[(1,3), :])
+    #plt.axis('equal')
+    #plt.show()
+
+    lines_angles = np.zeros(lines.T.shape + a.shape)
+    lines_angles[:, 0:2, :] = np.dot(lines_rot[0:2, :].T, R)
+    lines_angles[:, 2:4, :] = np.dot(lines_rot[2:4, :].T, R)
+
+    intersects = lines_angles[:, 1, :]*lines_angles[:, 3, :] < 0
+    intersect_lines_idx, intersect_angles_idx = np.nonzero(intersects)
+    p = lines_angles[intersect_lines_idx, 2:4, intersect_angles_idx]
+    q = lines_angles[intersect_lines_idx, 0:2, intersect_angles_idx]
+    v = p - q
+    n = v.dot(perp)
+    d = (n*p).sum(axis=1)
+    l = d/v[:, 1]
+    l[l < 0.0] = np.inf
+
+    rline = np.ones((lines.shape[1], a.shape[0]))*np.inf
+    rline[intersects] = l
+    return rline.min(axis=0)
+
+
+def sample_lidar(lines, x, y, theta, sigma2):
+    R = np.array([(+np.cos(theta), -np.sin(theta)),
+                  (+np.sin(theta), +np.cos(theta))])
+    lx_mu, ly_mu = (x, y) + R.dot(lidar_cartesian_offset)
+    ltheta_mu = theta - lidar_angular_offset
+    lx, ly, ltheta = np.random.normal((lx_mu, ly_mu, ltheta_mu), sigma2)
+    r_mu = simulate_lidar(lines, lx, ly, ltheta)
+    r = np.random.normal(r_mu, (r_mu**2)*sigma2_lidar_r)
+    #plt.scatter(r*np.cos(a), r*np.sin(a))
+    #plt.show()
+    return r
+
+
+def lidar_msg(r, stamp=None, frame_id='laser'):
+    ls = LaserScan()
+    ls.header.stamp = stamp
+    ls.header.frame_id = frame_id
+    ls.angle_min = angle_min
+    ls.angle_max = angle_max
+    ls.angle_increment = angle_increment
+    ls.scan_time = scan_time
+    ls.range_min = range_min
+    ls.range_max = range_max
+    ls.ranges = r
+    ls.intensities = [47.0 if ri < np.inf else 0.0 for ri in r]
+    return ls
+
+
+def pose_msg(x, y, theta, stamp=None, frame_id='map'):
+    ps = PoseStamped()
+    ps.header.stamp = stamp
+    ps.header.frame_id = frame_id
+    ps.pose.position.x = x
+    ps.pose.position.y = y
+    ps.pose.orientation = Quaternion(*quaternion_from_euler(0, 0, theta))
+    return ps
+
+
+def odom_msg(x, y, theta, v, w, stamp=None, frame_id='odom', child_frame_id='base'):
+    od = Odometry()
+    rot = quaternion_from_euler(0, 0, theta)
+    od.header.stamp = stamp
+    od.header.frame_id = frame_id
+    od.child_frame_id = child_frame_id
+    od.pose.pose.position.x = x
+    od.pose.pose.position.y = y
+    od.pose.pose.orientation = Quaternion(*rot)
+    od.twist.twist.linear.x = v
+    od.twist.twist.angular.z = w
+    return od
+
+
+class MotorControl(object):
+    def __init__(self):
+        self.t_motor_cmd, self.v, self.w = rospy.Time.now(), 0.0, 0.0
+        self.sub = rospy.Subscriber('/motor_controller/twist', Twist, self._setvel, queue_size=1000)
+
+    def _setvel(self, msg):
+        self.t_motor_cmd = rospy.Time.now()
+        self.v = msg.linear.x
+        self.w = msg.angular.z
+
+    def read(self):
+        td = rospy.Time.now() - self.t_motor_cmd
+        if td > rospy.Duration(0.2) and self.v**2 + self.w**2 > 0.0:
+            log.info('idle stop')
+            self.v, self.w = 0.0, 0.0
+        return self.v, self.w
+
+
+def main(args=sys.argv[1:]):
+    mapfn, x, y, theta = args
+    lines = np.ascontiguousarray(np.loadtxt(mapfn).T)
+    x, y, theta = eval(', '.join((x, y, theta)))
+
+    rospy.init_node('sim')
+    logcolor.basic_config(level=logging.DEBUG)
+
+    pose_pub = rospy.Publisher('/sim/true_pose', PoseStamped, queue_size=1, latch=True)
+    lidar_pub = rospy.Publisher('/scan', LaserScan, queue_size=5)
+    encoder_pub = rospy.Publisher('/odom/encoder', Odometry, queue_size=10)
+    lmsg = None
+    motorctl = MotorControl()
+    t0 = rospy.Time.now()
+
+    rate = rospy.Rate(control_frequency)
+    rate_lidar = rospy.Rate(lidar_frequency)
+
+    ex, ey, etheta = 0.0, 0.0, 0.0
+
+    while not rospy.is_shutdown():
+        t1 = rospy.Time.now()
+        v, w = motorctl.read()
+
+        dt = (t1 - t0).to_sec()
+        x += v*dt*np.cos(theta)
+        y += v*dt*np.sin(theta)
+        theta = (theta + w*dt) % (2*np.pi)
+        pose_pub.publish(pose_msg(x, y, theta, stamp=t1))
+
+        # Noise model is linear combination of 1, |v| and |w|
+        noise_coeffs = np.abs((1, v, w))
+
+        ev, ew = np.random.normal((v, w), sigma2_encoder.dot(noise_coeffs))
+        ex += ev*dt*np.cos(etheta)
+        ey += ev*dt*np.sin(etheta)
+        etheta = (etheta + ew*dt) % (2*np.pi)
+        encoder_pub.publish(odom_msg(ex, ey, etheta, ev, ew, stamp=t1))
+
+        if rate_lidar.remaining() <= rospy.Duration(0):
+            if lmsg is not None:
+                lidar_pub.publish(lmsg)
+            r = sample_lidar(lines, x, y, theta, sigma2_lidar.dot(noise_coeffs))
+            lmsg = lidar_msg(r, stamp=t1)
+            rate_lidar.sleep()
+        t0 = t1
+        rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,402 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#from mrbrain import grids
+import sys
+import logging, logcolor
+from os import path
+from contextlib import contextmanager
+from timeit import default_timer
+
+import rospy, tf
+import numpy as np
+from scipy.ndimage import filters
+from tf.transformations import euler_from_quaternion
+from sensor_msgs.msg import LaserScan, PointCloud2
+from nav_msgs.msg import OccupancyGrid
+import sensor_msgs.point_cloud2
+
+try:
+    from numba import jit
+except ImportError as e:
+    jit = lambda **kw: lambda f: f
+    use_jit = False
+else:
+    use_jit = True
+
+use_camera = False
+
+#from . import grids
+
+#Ocupancy mapping psudo code
+
+#main thing:
+#from table 9.1 Probabilistic Robotics page 237...
+# Main algo
+# 1. go over evry cell
+# 2. check if cell is crossed by laser beam (is measured)
+# 3. update cell value (in log probs) using inverse sensor model)
+# 4. if cell is not beeing measured keep value
+# inverse sensor model
+# 1. if distance to cell bigger as max measurable distance or measured distance + half the obstical size or outside the measuring beams return l_0 (prior of grid (this will result in no changes. (this basicly means that the cell is not in the perceptual field because of an obstical in the way
+# 2. if measurand distance is smaler as max dis and distance to cell minus measur max < half the obstical return l_occ (l_occ > l_0)
+# 3. if distance to cell < measured distance return l_free (l_free < l_0)
+#l_occ & l_free determin how fast map convergec
+
+# Others
+# - use robot pose to say grid is empty ... when the robot is there there can not be an obstical( given pose estimate is right...)
+
+#get ocupancy grid
+# need to have postition of robo (from mr.Kalman)
+#update grid when laser callback comes in
+
+#print("hello")
+
+log = logging.getLogger('mapper')
+
+def gu(v):
+    "si units -> grid units"
+    return (np.array(v)/UNIT - 0.4999).astype(np.int)
+
+def si(v):
+    "grid units -> si units"
+    return (np.array(v) + 0.5)*UNIT
+
+UNIT = 2e-2  # (m/u)
+SIZE = 5.5, 3.0
+SIZE_UNITS = gu(SIZE)
+
+ROBO_SIZE=0.17
+
+HIT_UNKNOWN = 0
+HIT_FREE = 1
+HIT_OCCUPIED = 2
+HIT_ROBOT = 4
+
+@contextmanager
+def timed_code(name=None):
+    next_unit = iter(("s", "ms", "ns", "us")).next
+    msg = "section %s took" % (name,) if name else "section took"
+    t0 = default_timer()
+    try:
+        yield msg
+    finally:
+        delta = default_timer() - t0
+        unit = next_unit()
+        while delta < 1:
+            delta *= 1000.0
+            try:
+                unit = next_unit()
+            except StopIteration:
+                break
+        log.info("%s: %.2f%s" % (msg, delta, unit))
+
+angle_min = -3.12413907051
+angle_max = +3.14159274101
+angle_increment = 0.0174532923847
+a = np.arange(angle_min, angle_max + angle_increment, angle_increment)
+angle_error=1.3*np.pi/180 #1/16 degree
+p_0 = 0.4
+p_free = 0.1
+p_occ = 0.8
+l_0 = np.log(p_0/(1-p_0))
+l_free = np.log(p_free/(1-p_free))
+l_occ = np.log(p_occ/(1-p_occ))
+p_threshold = 0.77
+#ignore_a1 = 4.55
+
+@jit(nopython=True, nogil=True)
+def beam_map(p0x, p0y, points, prx, pry, theta, step=1):
+    "Shoot triangular beams. Pew pew pew."
+    assert xs.shape == ys.shape
+    hits = np.zeros(xs.shape, dtype=np.uint8)
+    for i in range(points.shape[0] - 1, -1 + 1, -step):
+        ri, ai = points[i, :]
+        rj, aj = points[i-1, :]
+        #if ignore_a1*0.98 < ai < ignore_a1*1.02: continue
+        if not ((0.15 < ri < np.inf) and (0.15 < rj < np.inf)):
+            continue
+        if (ri-rj)**2 > (0.10)**2:
+            continue
+        px  = points[i, 0]*np.cos(points[i, 1]) + p0x
+        py  = points[i, 0]*np.sin(points[i, 1]) + p0y
+        qx  = points[i-1, 0]*np.cos(points[i-1, 1]) + p0x
+        qy  = points[i-1, 0]*np.sin(points[i-1, 1]) + p0y
+        vx, vy = qx - px, qy - py
+        vl = np.sqrt(vx**2 + vy**2)
+        #l = np.sqrt(ri/300.0)/vl/2.0
+        #p1x, p1y = px - vx*l, py - vy*l
+        #p2x, p2y = px + vx*l, py + vy*l
+        p1x, p1y = px, py
+        p2x, p2y = qx, qy
+        #p1x  = points[i, 0]*np.cos(points[i, 1] + ltheta + angle_error) + p0x
+        #p1y  = points[i, 0]*np.sin(points[i, 1] + ltheta + angle_error) + p0y
+        #p2x  = points[i, 0]*np.cos(points[i, 1] + ltheta - angle_error) + p0x
+        #p2y  = points[i, 0]*np.sin(points[i, 1] + ltheta - angle_error) + p0y
+        dblarea = (-p1y*p2x + p0y*(-p1x + p2x) + p0x*(p1y - p2y) + p1x*p2y)
+        s = 1.0/(dblarea)*(p0y*p2x - p0x*p2y + (p2y - p0y)*xs + (p0x - p2x)*ys)
+        t = 1.0/(dblarea)*(p0x*p1y - p0y*p1x + (p0y - p1y)*xs + (p1x - p0x)*ys)
+        points_free = (0 <= s)*(s <= 1)*(0 <= t)*(t <= 1)*(0 <= 1 - s - t)
+        vlen = np.sqrt((p2x-p1x)**2 + (p2y - p1y)**2)
+        points_occupied = points_free*(np.abs(dblarea*(1-s-t)) <= 0.025*vlen)
+        #hits[points_free] |= HIT_FREE
+        idx_rows, idx_cols = np.nonzero(points_free)
+        for i in range(idx_rows.shape[0]):
+            hits[idx_rows[i], idx_cols[i]] |= HIT_FREE
+        #hits[points_occupied] |= HIT_OCCUPIED
+        idx_rows, idx_cols = np.nonzero(points_occupied)
+        for i in range(idx_rows.shape[0]):
+            hits[idx_rows[i], idx_cols[i]] |= HIT_OCCUPIED
+
+    #hits for robo pose
+    xt=xs-prx #translate
+    yt=ys-pry
+    xr   =  np.cos(theta)*xt + np.sin(theta)*yt  # "cloclwise"
+    yr   = -np.sin(theta)*xt + np.cos(theta)*yt
+    xt=xr+prx #translate back
+    yt=yr+pry
+    points_free_robo=(np.abs(prx - xt) < ROBO_SIZE/2.0)*(np.abs(pry - yt) < ROBO_SIZE/2.0)
+    idx_rows, idx_cols = np.nonzero(points_free_robo)
+    for i in range(idx_rows.shape[0]):
+        hits[idx_rows[i], idx_cols[i]] |= HIT_ROBOT
+
+    return hits
+
+def robot_map(xs, ys, p0x, p0y, theta):
+    hits = np.zeros(xs.shape, dtype=np.uint8)
+
+    rot=theta
+    Xt=xs-p0x
+    Yt=ys-p0y
+    Xr   =  np.cos(rot)*Xt + np.sin(rot)*Yt  # "cloclwise"
+    Yr   = -np.sin(rot)*Xt + np.cos(rot)*Yt
+    Xt=Xr+p0x
+    Yt=Yr+p0y
+    hits[(np.abs(p0x - Xt) < ROBO_SIZE/2.0)*
+         (np.abs(p0y - Yt) < ROBO_SIZE/2.0)] = HIT_ROBOT
+    return hits
+
+class MapBuilder(object):
+    sigma = 0.2
+    hits = None
+    min_time = rospy.Duration(0.1)
+    min_time_save = rospy.Duration(5.0)
+
+    def __init__(self,mapfile):
+        self.lx=0.0
+        self.ly=0.0
+        self.ltheta=0
+        self.x=0.0
+        self.y=0.0
+        self.theta=0
+        self.cloud = None
+        self.map, self.x0, self.y0 = loadtxt(mapfile, dtype=np.float64)
+        self.log_map = l_0*np.ones(self.map.shape).view(type(self.map))
+        self.log_map[self.map == 1] = 5000.0*(l_occ - l_0)
+        self.map2, self.x0, self.y0 = loadtxt(mapfile, dtype=np.float64)
+        self.log_map2 = l_0*np.ones(self.map2.shape).view(type(self.map2))
+        self.log_map2[self.map2 == 1] = 5000.0*(l_occ - l_0)
+        self.map2[:, :] = 1.0 - 1.0/(1.0 + np.exp(self.log_map2))
+        if 0 and path.exists('/tmp/map.npy'):
+            self.map[:, :] = np.load('/tmp/map.npy')
+            self.log_map[:, :] = np.load('/tmp/log_map.npy')
+            self.map2[:, :] = np.load('/tmp/map2.npy')
+            self.log_map2[:, :] = np.load('/tmp/log_map2.npy')
+        self.tf_listener = tf.TransformListener()
+        self.sub_lidar = rospy.Subscriber('/scan', LaserScan, self.lidar_cb, queue_size=1)
+        self.pub_map = rospy.Publisher('/map/estimate_lidar', OccupancyGrid, queue_size=1)
+        self.pub_map2 = rospy.Publisher('/map/estimate_vision', OccupancyGrid, queue_size=1)
+        self.pub_map3 = rospy.Publisher('/map/estimate', OccupancyGrid, queue_size=1)
+        self.pub_hits = rospy.Publisher('/map/hits', OccupancyGrid, queue_size=1)
+        self.last_update = rospy.Time.now()
+        self.last_map_save = rospy.Time.now()
+        if use_camera:
+            self.sub_camera = rospy.Subscriber('/camera/input_to_map', PointCloud2, self.camera_cb, queue_size=1)
+        self.map_mean = self.map + self.map2 - self.map*self.map2
+
+    def lidar_cb(self,msg):
+        if msg.header.stamp - self.last_update < self.min_time:
+            return
+
+        #read in ranges from lidar
+        r = np.array(msg.ranges, dtype=np.float64)
+        #a = np.array(msg.angle, dtype=mp.float64)
+
+        t = msg.header.stamp #rospy.Time(0)
+        if self.tf_listener.canTransform('map', 'laser', t):
+            (self.lx, self.ly, _), rot = self.tf_listener.lookupTransform('map', 'laser', t)
+            _, _, self.ltheta = euler_from_quaternion(rot)
+            (self.x, self.y, _), rot = self.tf_listener.lookupTransform('map', 'base', t)
+            _, _, self.theta = euler_from_quaternion(rot)
+            log.info('set pose: %.2f, %.2f, %.2f', self.lx, self.ly, self.ltheta)
+        else:
+            log.warn('did not find current pose, ignoring update')
+            return
+
+        #new = filters.gaussian_filter(self.log_map, self.sigma, mode='nearest')
+        #self.log_map[np.abs(self.map - 0.5) < 0.2] += l_free - l_0
+        #new = filters.convolve(self.map, kernel/kernel.sum(), mode='nearest')
+        #self.map = new.view(type(self.map))
+        #self.log_map = np.log(1.0/(1.0 - self.map[:, :]) - 1.0)
+
+        with timed_code('update lidar'):
+            h, w = self.log_map.shape
+            # NB LiDAR is upside down, so the angles are negated to mirror this.
+            points = np.c_[r, -a + self.ltheta]
+            global xs, ys
+            xs, ys = np.meshgrid(si(np.arange(w)) - self.x0, si(np.arange(h)) - self.y0)
+            #points = np.array(list(sorted(points, reverse=True, key=lambda (ri, ai): ri)))
+            hits = beam_map(self.lx, self.ly, points,self.x,self.y,self.theta)
+            p = (np.mean(self.map[(hits & HIT_OCCUPIED) > 0]) + np.mean(1 - self.map[hits == HIT_FREE]))/2.0
+            log.info('p: %.3f', p)
+            if p < p_threshold:
+                log.warn('beam too unlikely, rejecting (p=%.3f)', p)
+            self.log_map[(hits & HIT_OCCUPIED) > 0] += l_occ - l_0
+            self.log_map[hits == HIT_FREE]          += l_free - l_0
+            self.log_map[(hits & HIT_ROBOT) > 0]    += 5*(l_free - l_0)
+            self.hits = hits
+            #hits = np.zeros(xs.shape)
+            #hits = robot_map(xs, ys, self.x,self.y,self.theta)
+            #self.log_map[(hits & HIT_ROBOT) == HIT_ROBOT] += l_occ*5 - l_0
+            self.map[:, :] = 1.0 - 1.0/(1.0 + np.exp(self.log_map))
+
+        if use_camera:
+            with timed_code('update camera'):
+                hits = np.zeros(self.map.shape, dtype=np.uint8)
+                occ, free = False, False
+                for point in sensor_msgs.point_cloud2.read_points(self.cloud, skip_nans=True):
+                    x = gu(point[0]+self.x0)
+                    y = gu(point[1]+self.y0)
+                    #h,w=self.log_map.shape
+                    #xs,ys=np.meshgrid(si(np.arange(w)) - self.x0, si(np.arange(h)) - self.y0)
+                    ##prefelter to eliminate stupid camera stuff
+                    #xt=xs-self.x
+                    #yt=ys-self.y
+                    #xr=np.cos(self.theta)*xt +np.sin(self.theta)*yt
+                    #yr=-np.sin(self.theta)*xt+np.cos(self.theta)*yt
+                    #xt=xr+self.x
+                    #yt=yr+self.y
+                    ##do prefilter
+                    #x= x[np.abs(self.x-xt)<ROBO_SIZE*2]
+                    #y= y[np.abs(self.y-yt)<ROBO_SIZE*2]
+                    
+                    if point[2] > 0.01:
+                        hits[y,x] = HIT_OCCUPIED
+                        occ = True
+                    else:
+                        #points_free_robo=(np.abs(self.x-xt)<ROBO_SIZE/2.0)*(np.abs(self.y-yt)<ROBO_SIZE/2.0)
+                        hits[y,x] = HIT_FREE
+                        #idx_rows, idx_cols=np.nonzero(points_free_robo)
+                        #for i in range(idx_rows.shape[0]):
+                        #    hits[idx_rows[i], idx_cols[i]] |=HIT_ROBOT
+                        free = True
+                p = 0.0
+                if occ: p += np.mean(self.map2[(hits & HIT_OCCUPIED) > 0])
+                if free: p += np.mean(1 - self.map2[hits == HIT_FREE])
+                log.info('pc=%.3f', p)
+                self.log_map2[(hits & HIT_OCCUPIED) > 0] += l_occ - l_0
+                self.log_map2[hits == HIT_FREE]          += l_free - l_0
+                self.map2[:, :] = 1.0 - 1.0/(1.0 + np.exp(self.log_map2))
+
+        #translate log map to occupancygrid map (0-100)
+        if use_camera:
+            self.map_mean = self.map + self.map2 - self.map*self.map2
+        else:
+            self.map_mean = self.map
+
+        if msg.header.stamp - self.last_map_save < self.min_time_save:
+            log.info('saving map')
+            np.save('/tmp/map', self.map)
+            np.save('/tmp/log_map', self.log_map)
+            np.save('/tmp/map2', self.map2)
+            np.save('/tmp/log_map2', self.log_map2)
+            self.last_map_save = msg.header.stamp
+
+        self.last_update = msg.header.stamp
+
+    def publish_maps(self):
+        self.pub_map.publish(self.map_msg(self.map, max=1.0))
+        if self.hits is not None:
+            self.pub_hits.publish(self.map_msg(self.hits, flags=True))
+        self.pub_map2.publish(self.map_msg(self.map2, max=1.0))
+        self.pub_map3.publish(self.map_msg(self.map_mean, max=1.0))
+
+    def map_msg(self, m, flags=False, max=None):
+        (h,w) = m.shape
+        msg = OccupancyGrid()
+        msg.info.resolution = UNIT
+        msg.info.width = w
+        msg.info.height = h
+        msg.info.origin.position.x = -self.x0
+        msg.info.origin.position.y = -self.y0
+        if flags:
+            msg.data = (99 + m.reshape((h*w,))).astype(np.int8)
+        else:
+            if max is None:
+                max = m.max()
+            msg.data = (1 + 97*m.reshape((h*w,))/max).astype(np.int8)
+        return msg
+
+    def camera_cb(self, cloud):
+        self.cloud = cloud
+
+class OccupancyGrid2(np.ndarray):
+
+    def line(self, (p0x,p0y,p1x,p1y), weight=1):
+        h, w = self.shape
+        xs, ys = np.meshgrid(si(np.arange(w)) - p0x,
+                             si(np.arange(h)) - p0y)
+        vx, vy = p0x-p1x, p0y-p1y
+        vlen2 = vx**2 + vy**2
+        nx, ny = vy, -vx
+        s = (nx*xs + ny*ys) / np.sqrt(vlen2)
+        t = -(vx*xs + vy*ys)
+        idx = (np.abs(s) < 0.03)*(0 < t)*(t < vlen2)
+        self[idx] = weight
+
+
+def loadtxt(f, cls=OccupancyGrid2, dtype=np.uint8):
+    grid = np.zeros(SIZE_UNITS, dtype=dtype).view(cls)
+    h, w = SIZE
+    lines = np.loadtxt(f)
+    if len(lines) > 0:
+        x0min, y0min, x1min, y1min = np.amin(lines, axis=0)
+        x0max, y0max, x1max, y1max = np.amax(lines, axis=0)
+        xmin, ymin = min(x0min, x1min), min(y0min, y1min)
+        xmax, ymax = max(x0max, x1max), max(y0max, y1max)
+        wmap, hmap = xmax - xmin, ymax - ymin
+        assert wmap <= w and hmap <= h, ((w, h), (wmap, hmap))
+        x0, y0 = (w-wmap)/2.0, (h-hmap)/2.0
+        for line in lines:
+            grid.line(line + (x0, y0, x0, y0))
+    else:
+        x0, y0 = w/2.0, h/2.0
+    return grid, x0, y0
+
+def main(args=sys.argv[1:]):
+    rospy.init_node('mapper')
+    logcolor.basic_config(level=logging.INFO)
+    args = rospy.myargv(args)
+
+    if not use_jit:
+        log.warn('numba installed or failed to import. '
+                 'mapping will be vely slow!')
+
+    dfl_map_fn = path.expanduser('~/map.txt')
+    mb = MapBuilder((args[:1] + [dfl_map_fn])[0])
+
+    #ltheta, r = -0.9, 2.2
+    #p0 = mb.lx, mb.ly
+    #p1 = mb.getendcell(r, ltheta - angle_error)
+    #p2 = mb.getendcell(r, ltheta + angle_error)
+    #mb.map.beam(p0, p1, p2,
+    #            free=(mb.l_free - mb.l_0),
+    #            occupied=(mb.l_occ - mb.l_0))
+
+    rate = rospy.Rate(4)
+    while not rospy.is_shutdown():
+            mb.publish_maps()
+            rate.sleep()
+
+
+if __name__ == "__main__":
+    main()

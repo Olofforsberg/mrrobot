@@ -1,0 +1,6 @@
+- git: {local-name: mrrobot, uri: 'git@gits-15.sys.kth.se:ludv/mrrobot.git'}
+- git: {local-name: robot_upstart, version: 'indigo-devel', uri: 'https://github.com/clearpathrobotics/robot_upstart'}
+- git: {local-name: uarm, uri: 'git@github.com:uArm-Developer/UArmForROS.git'}
+- git: {local-name: phidgets, uri: 'git@github.com:KTH-RAS/ras_phidget.git'}
+- git: {local-name: ras_realsense, version: 'f9eed92', uri: 'git@github.com:intel-ros/realsense.git'}
+- git: {local-name: cv_bridge, version: indigo, uri: 'git@github.com:ros-perception/vision_opencv.git'}

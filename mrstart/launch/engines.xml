@@ -1,0 +1,15 @@
+<launch>
+  <node respawn="true" name="left_motor" pkg="phidgets" type="motor" args="_name:=left_motor __name:=left_motor _serial:=469515 _frequency:=125">
+    <param name="_name" value="left_motor" />
+    <param name="__name" value="left_motor" />
+    <param name="_serial" value="469515" />
+    <param name="_frequency" value="125" />
+  </node>
+  <node respawn="true" name="right_motor" pkg="phidgets" type="motor" args="_name:=right_motor __name:=right_motor _serial:=468138 _frequency:=125">
+    <param name="_name" value="right_motor" />
+    <param name="__name" value="right_motor" />
+    <param name="_serial" value="468138" />
+    <param name="_frequency" value="125" />
+  </node>
+  <node respawn="true" name="mrmotor" pkg="mrmotor" type="mrmotor_node" args="" />
+</launch>

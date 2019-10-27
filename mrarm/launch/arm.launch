@@ -1,0 +1,4 @@
+<launch>
+  <node name="nanoarm" pkg="mrarm" type="nanoarm" output="screen" />
+  <node name="pick_up_marker" pkg="mrarm" type="pick_up_marker" output="screen" />
+</launch>

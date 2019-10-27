@@ -1,0 +1,575 @@
+#!/usr/bin/env python
+
+"More like PARTYcles"
+
+from __future__ import division, unicode_literals, print_function
+
+import sys
+import numpy as np
+import threading
+import logging
+import logcolor
+from os import path, environ
+from timeit import default_timer
+from contextlib import contextmanager
+
+import rospy, tf
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, PoseWithCovarianceStamped, Quaternion
+from visualization_msgs.msg import Marker, MarkerArray
+
+from delta_odom import DeltaOdometry
+
+try:
+    from pycephes import chi2
+    from numba import njit
+except:
+    from scipy.stats import chi2
+    numba_exc_info = sys.exc_info()
+    njit = lambda **kw: lambda f: f
+    use_jit, use_cache = False, False
+else:
+    use_jit, use_cache = True, False #sys.platform != 'darwin'
+
+log = logging.getLogger('pf')
+
+num_particles = int(environ.get('NUM_PARTICLES', 5000))
+
+@contextmanager
+def timed_code(name=None):
+    next_unit = iter(("s", "ms", "ns", "us")).next
+    msg = "section %s took" % (name,) if name else "section took"
+    t0 = default_timer()
+    try:
+        yield msg
+    finally:
+        delta = default_timer() - t0
+        unit = next_unit()
+        while delta < 1:
+            delta *= 1000.0
+            try:
+                unit = next_unit()
+            except StopIteration:
+                break
+        log.info("%s: %.2f%s" % (msg, delta, unit))
+
+
+def plot2d(X, *a, **k):
+    from matplotlib import pyplot as plt
+    show = k.pop('show', False)
+    plt.plot(X[:, 0], X[:, 1], *a, **k)
+    if show:
+        plt.show()
+
+
+@njit(cache=use_cache)
+def random_choice(n, p, tot=None):
+    assert not np.any(np.isnan(p))
+    assert p.shape[0] == n
+    tot = np.sum(p) if tot is None else tot
+    r = np.random.uniform(0, tot)
+    for i in range(n):
+        r -= p[i]
+        if r <= 0:
+            return i
+    raise ValueError(b'tot is not total of p')
+
+# {{{ ICP
+
+@njit(nogil=True, cache=use_cache)
+def best_fit_transform(A, B):
+    """Find best rigid-body transform of A unto B as a rotation and a
+    translation. A and B are in non-homogenous coordinates; the returned
+    transformation is however for homogenous coordinates.
+    """
+    # translate points to their centroids
+    centroid_A = np.array((np.mean(A[:, 0]), np.mean(A[:, 1])))
+    centroid_B = np.array((np.mean(B[:, 0]), np.mean(B[:, 1])))
+    AA = A - centroid_A
+    BB = B - centroid_B
+
+    # rotation matrix
+    H = np.dot(AA.T, BB)
+    U, S, Vt = np.linalg.svd(H)
+    R = np.dot(Vt.T, U.T)
+
+    if R[0,0]*R[1,1] < R[0,1]*R[1,0]:
+        Vt[-1,:] *= -1
+        R = np.dot(Vt.T, U.T)
+    t = centroid_B.T - np.dot(R,centroid_A.T)
+
+    # homogeneous transformation
+    T = np.eye(3)
+    T[0:2, 0:2] = R
+    T[0:2, 2] = t
+
+    return T
+
+
+@njit(nogil=True, cache=use_cache)
+def closest_points(vs, ws):
+    n, m = vs.shape[0], ws.shape[0]
+    indices = np.zeros(n, dtype=np.uint32)
+    dist2s = np.inf*np.ones(n, dtype=np.float64)
+    for i in range(n):
+        for j in range(m):
+            diff = vs[i, :] - ws[j, :]
+            dist2 = np.dot(diff, diff)
+            if dist2 < dist2s[i]:
+                indices[i], dist2s[i] = j, dist2
+    return indices, np.sqrt(dist2s)
+
+
+@njit(cache=use_cache)
+def icp(A, B, max_iterations=75, tolerance=1e-3, convergence=3e-6,
+        max_dist=15e-2, num_sample=50):
+    # make points homogeneous, copy them so as to maintain the originals
+    src = np.ones((3, A.shape[0]))
+    dst = np.ones((3, B.shape[0]))
+    for i in range(A.shape[0]):
+        src[0:2, i] = A[i, :]
+    for i in range(B.shape[0]):
+        dst[0:2, i] = B[i, :]
+
+    T = np.eye(3)
+    n = A.shape[0]
+    num_sample = min(n, num_sample)
+    mean_error = np.inf
+    prev_error = mean_error
+
+    sample = np.random.choice(n, num_sample, replace=False)
+    indices, distances = closest_points(src[0:2, sample].T, dst[0:2, :].T)
+
+    for i in range(max_iterations):
+        prev_error, mean_error = mean_error, distances.mean()
+        if mean_error < tolerance or np.abs(prev_error - mean_error) < convergence:
+            break
+
+        # compute the transformation between the current source and nearest
+        # destination points
+        matched, = np.nonzero(distances < max_dist)
+        Ti = best_fit_transform(src[0:2, sample[matched]].T,
+                                dst[0:2, indices[matched]].T)
+
+        # update the current source
+        src = np.dot(Ti, src)
+        T = np.dot(Ti, T)
+
+        sample = np.random.choice(n, num_sample, replace=False)
+        indices, distances = closest_points(src[0:2, sample].T, dst[0:2, :].T)
+
+    R = T[0:2, 0:2]
+    t = T[0:2, 2]
+
+    #from matplotlib import pyplot as plt
+    #plt.clf()
+    #plt.title('t=%s, R=%s, err=%s' % (t, np.arctan2(R[0, 1], R[0, 0]), mean_error))
+    #plot2d(dst[0:2, :].T, '*r', label='dst')
+    #plot2d(src[0:2, :].T, '*b', label='src (adjusted)')
+    #for i, j in zip(sample, indices):
+    #    plot2d(np.array([src[0:2, i], dst[0:2, j]]), 'k-')
+    #plt.legend()
+    #plt.savefig('/tmp/icp.pdf')
+    #print(i, mean_error)
+
+    return R, t, mean_error
+
+# }}}
+
+perp = np.array([(0.0, +1.0),
+                 (-1.0, 0.0)])
+angle_min = -3.12413907051
+angle_max = +3.14159274101
+angle_increment = 0.0174532923847
+a = np.arange(angle_min, angle_max + angle_increment, angle_increment) - 1.468*np.pi
+R = np.array([(+np.cos(a), -np.sin(a)),
+              (+np.sin(a), +np.cos(a))])
+
+lidar_cartesian_offset = np.r_[-0.11, -0.0128]
+lidar_angular_offset = 0.010*np.pi
+lidar_const_stddev = 1e-2 # base std deviation
+lidar_range_stddev = 5e-3 # deviation per meter
+lidar_min_hit_range = 0.10
+lidar_max_hit_range = 6.0
+lidar_num_sample_hits = 130
+lidar_num_best_hits = 110
+lidar_min_num_hits = lidar_num_sample_hits
+
+# Threshold at which we start using ICP to find an improved estimate of the
+# best particle's parameters. We use a chi square distribution to test the
+# observed data against our hypothesis, using ICP when the confidence is > 99%.
+# NOTE Currently unused, always doing the ICP for now.
+lidar_icp_max_q = chi2.ppf(0.80, lidar_num_best_hits - 1)
+
+# Threshold at which we start publishing the pose of the particles
+lidar_pose_max_dof = 10
+lidar_pose_max_q = 5e3
+
+
+@njit(nogil=True, cache=use_cache)
+def findlengths(lines, x, y, idx, theta):
+    lines_trans = lines.copy()
+    lines_trans[0, :] -= x
+    lines_trans[1, :] -= y
+    lines_trans[2, :] -= x
+    lines_trans[3, :] -= y
+
+    lines_rot = np.zeros(lines_trans.shape)
+    Rtheta = np.array([(+np.cos(-theta), -np.sin(-theta)),
+                       (+np.sin(-theta), +np.cos(-theta))])
+    lines_rot[0:2, :] = np.dot(Rtheta, lines_trans[0:2, :])
+    lines_rot[2:4, :] = np.dot(Rtheta, lines_trans[2:4, :])
+
+    min_dist_angle = np.zeros(len(idx))
+    lines_angle = np.zeros(lines.shape)
+    for i in range(len(idx)):
+        Ri = R[:, :, idx[i]]
+        lines_angle[0:2, :] = np.dot(Ri, lines_rot[0:2, :])
+        lines_angle[2:4, :] = np.dot(Ri, lines_rot[2:4, :])
+        intersects = lines_angle[1, :]*lines_angle[3, :] < 0
+        intersect_lines_idx, = np.nonzero(intersects)
+        min_dist = np.inf
+        for j in intersect_lines_idx:
+            p = lines_angle[2:4, j]
+            q = lines_angle[0:2, j]
+            v = q - p
+            n = np.dot(perp, v)
+            d = np.dot(n, p)
+            l = d/v[1]
+            if 0.0 < l < min_dist:
+              min_dist = l
+        min_dist_angle[i] = min_dist
+
+    return min_dist_angle
+
+
+@njit(nogil=True, cache=use_cache)
+def weights(lines, particles, r, idx):
+    M = particles.shape[0]
+    q = np.zeros(M)
+    rs = np.zeros((M, len(idx)))
+    for i in range(M):
+        x, y, theta = particles[i, :]
+        rs[i, :] = findlengths(lines, x, y, idx, theta)
+        err = rs[i, :].copy()
+        err -= r
+        err /= lidar_const_stddev + r*lidar_range_stddev
+        err **= 2
+        err.sort()
+        q[i] = err[:lidar_num_best_hits].sum()
+    return rs, q
+
+
+@njit(nogil=True, cache=use_cache)
+def qs_to_dist(q):
+    p = 1.0/q
+    #p = chi2.sf(q, lidar_num_best_hits - 1)
+    p[np.isinf(q)] = 0.0
+    psum = np.sum(p)
+    if psum < 1e-5:
+        p[:] = 1.0/p.shape[0]
+    else:
+        p /= psum
+    return p
+
+
+@njit(nogil=True, cache=use_cache)
+def kld_resample(lines, particles, dt, dp, dtheta, r, r_idx, rs, q, tol2=(1e-5)**2):
+    "Kullback-Leibler distance sampling"
+
+    dt = 0.02
+    kv = 0.03  # Coeff. for linear noise due to linear velocity
+    kd = 0.03  # Coeff. for angular noise due to linear velocity
+    kw = 0.03  # Coeff. for angular noise due to angular velocity
+    icp_tolerance = 5e-3
+    icp_max_error = 5e-2
+    eps, delta = 0.02, 0.01
+    binlenx, binleny, binlentheta = 1e-2, 1e-2, 2.0/(5*np.pi)
+    nxmin, nxmax = 50, 1e3
+
+    M = particles.shape[0]
+    dpnorm = np.sqrt(np.dot(dp, dp))
+
+    best = q.argmin()
+    bx, by, btheta = particles[best, :]
+    rp = findlengths(lines, bx, by, r_idx, btheta)
+    idx, = np.nonzero(rp < np.inf)
+    us = np.zeros((len(idx), 4))
+    us[:, 0] = rp[idx]*np.cos(a[r_idx[idx]])
+    us[:, 1] = rp[idx]*np.sin(a[r_idx[idx]])
+    us[:, 2] = r[idx]*np.cos(a[r_idx[idx]])
+    us[:, 3] = r[idx]*np.sin(a[r_idx[idx]])
+    R, (tx, ty), err = icp(us[:, 0:2], us[:, 2:4], tolerance=icp_tolerance)
+    if err < icp_max_error:
+        Rp = np.array([(+np.cos(particles[best, 2]), -np.sin(particles[best, 2])),
+                       (+np.sin(particles[best, 2]), +np.cos(particles[best, 2]))])
+        particles[best, 0:2] -= np.dot(Rp, np.array((tx, -ty)))
+        particles[best,   2] -= np.arctan2(R[0, 1], R[0, 0])
+        #particles[:, 0:2] = particles[:, 0:2] + dp
+        #particles[:,   2] = particles[:,   2] + da
+        #dp, dtheta = np.array((0.0, 0.0)), 0.0
+        rs[best:best+1, :], q[best:best+1] = weights(lines, particles[best:best+1, :], r, r_idx)
+        #log.info('icp fit %.3f, %.3f, %.3f (q=%.2f, err=%.2f)',
+        #         tx, ty, dtheta, q[best], err)
+    else:
+        #log.warn('icp fit is too poor to use (err=%.2f)', err)
+        best = -1
+
+    p = qs_to_dist(q)
+    new, bins, nx = [], set(), nxmin
+    while (len(new) < nx or len(new) < nxmin) and len(new) < nxmax:
+        # Sample from weights
+        i = random_choice(M, p, tot=1.0)
+        x, y, theta = particles[i, :]
+
+        # Update state
+        ltheta = theta + lidar_angular_offset
+        R = np.array([(+np.cos(theta), -np.sin(theta)),
+                      (+np.sin(theta), +np.cos(theta))])
+        Rl0 = np.array([(+np.cos(ltheta), -np.sin(ltheta)),
+                        (+np.sin(ltheta), +np.cos(ltheta))])
+        Rl1 = np.array([(+np.cos(ltheta + dtheta), -np.sin(ltheta + dtheta)),
+                        (+np.sin(ltheta + dtheta), +np.cos(ltheta + dtheta))])
+        dxrot, dyrot = np.dot(R, dp) + np.dot(Rl1 - Rl0, lidar_cartesian_offset)
+
+        # Noise model
+        move = (i != best) and (np.random.uniform(0, 1) > 0.05)
+        x     += move*dxrot  + np.random.normal(0,       0.05*dt + move*np.abs(dxrot*kd))
+        y     += move*dyrot  + np.random.normal(0,       0.05*dt + move*np.abs(dyrot*kd))
+        theta += move*dtheta + np.random.normal(0, 2*np.pi/20*dt + move*(np.abs(dtheta*kw) + np.abs(dpnorm*kv)))
+
+        # Adaptive sample size
+        new.append((x, y, theta))
+        b = x//binlenx, y//binleny, theta//binlentheta
+        if b not in bins:
+            bins.add(b)
+            if len(new) >= nxmin:
+                nx = chi2.ppf(delta, len(bins) - 1) / (2*eps)
+
+    particles = np.array(new)
+    rs, q = weights(lines, particles, r, r_idx)
+    return particles, rs, q, len(bins) - 1
+
+class ParticleFilter(object):
+    def __init__(self, lines, particles=[]):
+        self.lines = lines
+        self.particles = particles
+        self.pose = 0.0, 0.0, 0.0
+        self.last_pose_reset = rospy.Time.now()
+        self._lock = threading.Lock()
+        self.pub_pose = rospy.Publisher('/pf/pose_estimate', PoseStamped, queue_size=5)
+        self.pub_particles = rospy.Publisher('/pf/particles', PoseArray, queue_size=5)
+        self.sub_lidar = rospy.Subscriber('/scan', LaserScan, self._lidar_cb, queue_size=1)
+        self.sub_populate = rospy.Subscriber('/pf/populate', PoseWithCovarianceStamped, self._populate_cb, queue_size=1)
+        self.odom = DeltaOdometry('/odom/kalman')
+        self.tfb = tf.TransformBroadcaster()
+        self.rs, self.q = None, None
+
+    def populate_global(self, num=num_particles, margin=0.05):
+        log.info('populating %d particles over entire map', num)
+        x0min, y0min, x1min, y1min = np.amin(self.lines, axis=1)
+        x0max, y0max, x1max, y1max = np.amax(self.lines, axis=1)
+        xmin, ymin = np.amin(((x0min, x1min), (y0min, y1min)), axis=0)
+        xmax, ymax = np.amin(((x0max, x1max), (y0max, y1max)), axis=0)
+        w, h = xmax - xmin, ymax - ymin
+        self.particles = np.c_[
+            np.random.uniform(xmin - margin*w, xmax + margin*w, num),
+            np.random.uniform(ymin - margin*h, ymax + margin*h, num),
+            np.random.uniform(0.0, 2.0*np.pi, num)
+        ]
+        self.rs, self.q = None, None
+
+    def populate_pose(self, x, y, theta, num=num_particles):
+        log.info('populating %d particles at %.3f, %.3f, %.3f', num, x, y, theta)
+        self.particles = np.c_[
+            np.random.normal(x, 0.2, num),
+            np.random.normal(y, 0.2, num),
+            np.random.normal(theta, 10.0/(2.0*np.pi), num)
+        ]
+        self.rs, self.q = None, None
+
+    def _populate_cb(self, pose):
+        while hasattr(pose, 'pose'):
+            pose = pose.pose
+        pos, orient = pose.position, pose.orientation
+        _, _, theta = euler_from_quaternion((orient.x, orient.y, orient.z, orient.w))
+        x, y = pos.x, pos.y
+        if x == 0.0 and y == 0.0 and theta == 0.0:
+            self.populate_global()
+        else:
+            self.populate_pose(x, y, theta)
+
+    def resample(self, t, r):
+        try:
+            dt, dp, dtheta = self.odom.read_reset(t=t)
+        except IndexError as e:
+            log.debug('particle move failed: %s', e)
+            dt, dp, dtheta = (t - self.odom.t0), (0.0, 0.0), 0.0
+        #if dt <= rospy.Duration(0):
+        #    log.debug('no odometry updates received')
+        #    return
+        idx, = np.nonzero((lidar_min_hit_range <= r)*(r < lidar_max_hit_range))
+        if len(idx) < lidar_min_num_hits:
+            log.warn('insufficient lidar scan hits')
+            return
+        dt, dp = dt.to_sec(), np.r_[dp]
+        old = self.particles
+        idx = np.random.choice(idx, lidar_num_sample_hits, p=r[idx]/r[idx].sum())
+        if self.rs is None:
+            self.rs, self.q = weights(self.lines, self.particles, r[idx], idx)
+        new, rs, q, df = kld_resample(self.lines, self.particles,
+                                      dt, dp, dtheta, r[idx], idx,
+                                      self.rs, self.q)
+        if self.particles is not old:
+            return
+        log.info('resampled %d particles (min(q)=%.3f)', len(new), np.min(q))
+        self.particles, self.rs, self.q, self.dof = new, rs, q, df
+
+    def update(self, scan):
+        lidar_lag = rospy.Duration(float(rospy.get_param('lidar_lag', 0.0)))
+        pose_reset_interval = rospy.Duration(float(rospy.get_param('pose_reset_interval', 0.4)))
+        t = scan.header.stamp - lidar_lag
+        r = np.array(scan.ranges, dtype=np.float64)
+        with timed_code('resampling'):
+            self.resample(t, r)   
+
+        now = rospy.Time.now()
+
+        if now - self.last_pose_reset < pose_reset_interval:
+            return
+
+        if self.dof > lidar_pose_max_dof:
+            log.warn('particle dof high, not publishing '
+                     'new pose (dof=%d)', self.dof)
+            return
+
+        if self.q.min() > lidar_pose_max_q:
+            log.warn('particle min(q) high, not publishing new pose')
+            return
+
+        self.pose = self.estimate_pose()
+        x, y, theta = self.pose
+        log.info('pose (%.2f sec old): %.3f, %.3f, %.3f (dof=%.3f)',
+                 (now - t).to_sec(), x, y, theta, self.dof)
+        self.last_pose_reset = now
+        self.publish_pose(t)
+
+    def _lidar_cb(self, scan):
+        if not self._lock.acquire(False):
+            log.warn('ignoring reentrant lidar scan')
+            return
+        try:
+            self.update(scan)
+        finally:
+            self._lock.release()
+
+    def _lidar_to_base(self, lx, ly, ltheta):
+        theta = ltheta + lidar_angular_offset
+        R_lidar = np.array([(+np.cos(theta), -np.sin(theta)),
+                            (+np.sin(theta), +np.cos(theta))])
+        x, y = (lx, ly) - R_lidar.dot(lidar_cartesian_offset)
+        return x, y, theta
+
+    def estimate_pose(self):
+        p = qs_to_dist(self.q)
+        ltheta = np.arctan2(np.sum(p*np.sin(self.particles[:, 2])),
+                            np.sum(p*np.cos(self.particles[:, 2])))
+        lx, ly = np.sum(p[:, np.newaxis]*self.particles[:, 0:2], axis=0)
+        return self._lidar_to_base(lx, ly, ltheta)
+
+    def _pose_msg(self, x, y, theta):
+        pose = Pose()
+        pose.position.x = x
+        pose.position.y = y
+        pose.orientation = Quaternion(*quaternion_from_euler(0, 0, theta))
+        return pose
+
+    def publish_pose(self, t):
+        x, y, theta = self.pose
+        pose_msg = PoseStamped()
+        pose_msg.header.frame_id = 'map'
+        pose_msg.header.stamp = t
+        pose_msg.pose = self._pose_msg(x, y, theta)
+        self.pub_pose.publish(pose_msg)
+
+    def publish_particles(self):
+        parr = PoseArray()
+        parr.header.frame_id = 'map'
+        parr.header.stamp = rospy.Time.now()
+        parr.poses = [self._pose_msg(*self._lidar_to_base(*lparams))
+                      for lparams in self.particles]
+        self.pub_particles.publish(parr)
+
+def make_map_markers(lines):
+    all_markers = MarkerArray()
+    for wall_id, (x1, y1, x2, y2) in enumerate(lines.T):
+        angle = np.arctan2(y2-y1,x2-x1)
+        dist = np.sqrt((x1-x2)**2 + (y1-y2)**2)
+        wall_marker = Marker()
+        wall_marker.header.frame_id = 'map'
+        wall_marker.header.stamp = rospy.Time.now()
+        wall_marker.ns = "world"
+        wall_marker.type = Marker.CUBE
+        wall_marker.action = Marker.ADD
+        wall_marker.scale.y = 0.01
+        wall_marker.scale.z = 0.2
+        wall_marker.color.a = 1.0
+        wall_marker.color.r = 1.0
+        wall_marker.color.g = 0.0
+        wall_marker.color.b = 0.0
+        wall_marker.pose.position.z = 0.1
+        wall_marker.scale.x = max((0.01, dist))
+        wall_marker.pose.position.x = (x1+x2)/2.0
+        wall_marker.pose.position.y = (y1+y2)/2.0
+        wall_marker.pose.orientation = Quaternion(*quaternion_from_euler(0, 0, angle))
+        wall_marker.id = wall_id
+        all_markers.markers.append(wall_marker)
+    return all_markers
+
+def main(args=sys.argv[1:]):
+    rospy.init_node('pf')
+    logcolor.basic_config(level=logging.INFO)
+    args = rospy.myargv(args)
+
+    if not use_jit:
+        log.warn('numba or pycephes not installed. '
+                 'particle filter will be very slow!',
+                 exc_info=numba_exc_info)
+    else:
+        log.info('using numba acceleration (use_cache=%s)', use_cache)
+
+    # Load lines from map
+    dfl_map_fn = path.expanduser('~/map.txt')
+    fn, x, y, theta = args + [dfl_map_fn, '', '', ''][:4-len(args)]
+    lines = np.ascontiguousarray(np.loadtxt(fn).T)
+    pf = ParticleFilter(lines=lines)
+
+    if not all((x, y, theta)):
+        pf.populate_global()
+    else:
+        x, y, theta = eval(x), eval(y), eval(theta)
+        pf.populate_pose(x, y, theta)
+
+    #pf.particles[:, 0:2] = np.r_[0.770669242093, 0.381767591424] + (0.11, 0.05) - (0.02, 0.0)
+
+    #x,y,theta=pf.particles[0]
+    #print('params:', x,y,theta)
+    #idx = np.arange(a.shape[0])[::1]
+    #r = findlengths(lines, x, y, idx, theta)
+    #from matplotlib import pyplot as plt
+    #plt.scatter(r*np.sin(a[idx]), r*np.cos(a[idx]))
+    #plt.axis('equal')
+    #plt.show()
+    #return
+
+    rate = rospy.Rate(20)
+    pub_walls = rospy.Publisher('/maze_map', MarkerArray, queue_size=1, latch=True)
+    all_markers = make_map_markers(lines)
+    while not rospy.is_shutdown():
+        pub_walls.publish(all_markers)
+        pf.publish_particles()
+        rate.sleep()
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,69 @@
+#!/usr/bin/env python
+
+import sys
+import threading
+import numpy as np
+import logging
+import logcolor
+import rospy, tf
+from bisect import bisect_right
+from tf.transformations import quaternion_from_euler, euler_from_quaternion
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav_msgs.msg import Odometry
+from delta_odom import DeltaOdometry
+
+log = logging.getLogger('odom')
+
+
+def odom_msg(t, x, y, theta, frame_id='odom', child_frame_id='base'):
+    msg = Odometry()
+    msg.header.stamp = t
+    msg.header.frame_id = frame_id
+    msg.child_frame_id = child_frame_id
+    msg.pose.pose.position.x = x
+    msg.pose.pose.position.y = y
+    msg.pose.pose.orientation = Quaternion(*quaternion_from_euler(0,0, theta))
+    return msg
+
+
+class PoseReceiver(object):
+    def __init__(self, odom, position=(0.0, 0.0, 0.0), orientation=(0.0, 0.0, 0.0, 0.0)):
+        self.odom = odom
+        self.position = position
+        self.orientation = orientation
+        self.sub = rospy.Subscriber('/pf/pose_estimate', PoseStamped, self._pose_cb, queue_size=1)
+    
+    def _pose_cb(self, msg):
+        now = rospy.Time.now()
+        pos, orient = msg.pose.position, msg.pose.orientation
+        self.position = (pos.x, pos.y, pos.z)
+        self.orientation = (orient.x, orient.y, orient.z, orient.w)
+        self.odom.reset(t=msg.header.stamp)
+
+
+def main(args=sys.argv[1:]):
+    rospy.init_node('odom')
+    args = rospy.myargv(args)
+    logcolor.basic_config(level=logging.INFO)
+    odom = None
+    for topic in args or ['/odom/encoder']:
+        odom = DeltaOdometry(odom_topic=topic, child=odom)
+    odom_pub = rospy.Publisher('/odom/kalman', Odometry, queue_size=10)
+    odom_delta_pub = rospy.Publisher('/odom/kalman/delta', Odometry, queue_size=10)
+    global_pose = PoseReceiver(odom)
+    br = tf.TransformBroadcaster()
+    rate = rospy.Rate(20)
+
+    while not rospy.is_shutdown():
+        now = rospy.Time.now()
+        t, (x, y), theta = odom.read_absolute()
+        odom_pub.publish(odom_msg(t, x, y, theta))
+        dt, (dx, dy), dtheta = odom.read()
+        rot = quaternion_from_euler(0, 0, dtheta)
+        br.sendTransform((dx, dy, 0), rot, now, 'base', 'odom')
+        br.sendTransform(global_pose.position, global_pose.orientation, now, 'odom', 'map')
+        odom_delta_pub.publish(odom_msg(now, dx, dy, dtheta))
+        rate.sleep()
+
+if __name__ == "__main__":
+    main()

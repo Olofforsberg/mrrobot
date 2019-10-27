@@ -1,0 +1,20 @@
+#!/usr/bin/python
+import time
+import rospy
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PointStamped
+rospy.init_node('pick_up_marker', anonymous=True)
+pub = rospy.Publisher('/arm/take', PointStamped, queue_size=5, latch=True)
+#published = False
+def cb(marker):
+    #global published
+    #if published:
+    #    return
+    published = True
+    p = PointStamped()
+    p.header = marker.header
+    p.point = marker.pose.position
+    pub.publish(p)
+    print p
+sub = rospy.Subscriber('/visualization_marker', Marker, cb, queue_size=1)
+rospy.spin()

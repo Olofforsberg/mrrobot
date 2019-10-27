@@ -1,0 +1,287 @@
+#!/usr/bin/python
+
+import numpy as np
+from os import path, environ
+
+import tf
+import rospy
+import pyuarm
+import tf2_ros
+import tf2_geometry_msgs
+from ros_kth_uarm import kth_uarm
+from std_msgs.msg import UInt8, Header, Bool
+from geometry_msgs.msg import PoseStamped, PointStamped, Transform, TransformStamped, Quaternion
+import time 
+from mrarm.srv import armtest, armtestResponse
+from std_srvs.srv import SetBool
+
+class eyes_to_arm(object):
+    def __init__(self):
+        self.have_object = False
+#        rospy.init_node('nanoarm')  
+        rospy.Subscriber('/check/object', Bool, self.callback)
+        self.pub_color_detect = rospy.Publisher('/check/order', Bool, queue_size=10)
+        self.pub_mreyes = rospy.Publisher('arm_to_camera', Bool, queue_size=10)
+        rospy.Subscriber('arm/put_down', Bool, self.callback2)
+        rospy.Subscriber('arm/boobie', PointStamped, self.callback3)        
+        rospy.Subscriber('arm/put_down/boobie', Bool, self.callback4)
+    def callback(self,new):
+        messege = Bool()
+        messege.data = False
+        if new.data == True:
+            L.append(('move', (0,0.15,0.08)))
+            print("did get it")
+        else:
+            pump(0)
+            L.append(('move', (0,0.15,0.08)))
+            print("did not get it")
+            messege = Bool()
+            messege.data = False
+            self.pub_mreyes.publish(messege)
+        self.pub_color_detect.publish(messege)
+    
+    def callback2(self, m):
+        pump(0)
+
+    def callback3(self, point):
+        p = tf_buffer.transform(point, 'arm_coords_origin').point
+        L.append(('take_boobie', (p.x, p.y, p.z)))
+    
+    def callback4(self, msg):
+            L.append(('leave_boobie',(0,0,0)))
+
+calfn = path.expanduser('~/uarm_calibration.cfg')
+karm = kth_uarm.KTHUarm(calfn, uarm=pyuarm.uArm('/dev/uarm'))   
+rospy.init_node('nanoarm', anonymous = True)
+tf_buffer = tf2_ros.Buffer()
+tfl = tf2_ros.TransformListener(tf_buffer)
+tfb = tf2_ros.TransformBroadcaster()
+
+if environ.get('KTH_ARM_CALIBRATE'):
+    karm.calibrate(calfn)
+
+if environ.get('KTH_ARM_DETACHED'):
+    karm.detach_all_servos()
+
+L = []
+
+def pump_callback(msg):
+    L.append(('pump', (msg.data,)))
+    karm.pump(msg.data)
+
+def move_to_pose_callback(pose):
+    pose = tf_buffer.transform(pose, 'arm_coords_origin').pose
+    p, r = pose.position, pose.orientation
+    roll, pitch, yaw = tf.transformations.euler_from_quaternion((r.x, r.y, r.z, r.w))
+    L.append(('move', (p.x, p.y, p.z, yaw)))
+
+def move_to_callback(point):
+    p = tf_buffer.transform(point, 'arm_coords_origin').point
+    L.append(('move', (p.x, p.y, p.z)))
+
+def take_callback(point):
+    p1 = tf_buffer.transform(point, 'arm_coords_origin').point
+    global take_point
+    take_point = p1
+
+def boobie_callback(point):
+    p1 = tf_buffer.transform(point, 'arm_coords_origin').point
+    global boobie_point
+    boobie_point = p1
+
+rospy.Subscriber('/arm/pump_control', UInt8, pump_callback)
+rospy.Subscriber('/arm/move_to', PointStamped, move_to_callback)
+rospy.Subscriber('/arm/move_to_pose', PoseStamped, move_to_pose_callback)
+rospy.Subscriber('/arm/take',PointStamped,take_callback)
+rospy.Subscriber('arm/boobie', PointStamped, boobie_callback)        
+
+check_object_status = rospy.ServiceProxy('check_object_status', SetBool)
+
+def camera_check():
+    rospy.wait_for_service('check_object_status')
+    try:
+        resp1 = check_object_status(True)
+        return resp1.success
+    except rospy.ServiceException, e:
+        print "Service call failed: %s"%e
+
+
+def arm_take():
+    s = rospy.Service('arm_take', armtest, service_take)
+    print "Arm_take service"
+    rospy.spin()
+
+def service_take(req):
+    return armtestResponse(_service_take(req.input))
+
+def _service_take(req):
+    if req == "take": 
+        take(take_point.x,take_point.y,take_point.z)
+        if not success:
+            raise rospy.ServiceException("taken_failed")
+        return "taken_successfull"
+    if req == "put_down":
+        put_down()
+        return "done_putting"
+    if req == "take_boobie":
+        take_boobie(boobie_point.x,boobie_point.y,boobie_point.z)
+        return "boobie is taken"
+    if req == "leave_boobie":
+        leave_boobie()
+        return "boobie is returned"
+    raise rospy.ServiceException('unknown request input %s' % (req,))
+
+def update_tf():
+    (x, y, z), theta = karm.get_pose()
+    transmsg = TransformStamped()
+    transmsg.header.stamp = rospy.Time.now()
+    transmsg.header.frame_id = 'arm_coords_origin'
+    transmsg.child_frame_id = 'arm_effector'
+    transmsg.transform.translation.x = x/100.0
+    transmsg.transform.translation.y = y/100.0
+    transmsg.transform.translation.z = z/100.0
+    transmsg.transform.rotation = Quaternion(*tf.transformations.quaternion_from_euler(0, 0, theta/180.0*np.pi))
+    tfb.sendTransform(transmsg)
+
+def pump(v):
+    print('pump', v)
+    karm.pump(v)
+
+def move(x, y, z, r=np.pi/2):
+    print('move', (x, y, z, r))
+    karm.move_cartesian(100*x, 100*y, 100*z, r*180/np.pi, check_limits=False)
+
+def move2(x, y, z, r=np.pi/2):
+    print('move', (x, y, z, r))
+    karm.move_cartesian(100*x, 100*y, 100*z, r*180/np.pi, interpolation_type = "Cubic", duration = 1, check_limits=False)
+
+def change_coord(x,y,r):
+    xy_angle = np.arctan2(y, x)
+    xy_r = np.sqrt(y**2 + x**2)
+    xy_r += r
+    tx, ty = 100.0*np.r_[xy_r*np.cos(xy_angle), xy_r*np.sin(xy_angle)]
+    return tx,ty    
+
+def take(x, y, z):
+    x_b,y_b,z_b = arm_to_base(x,y,z)
+    x_a_1,y_a_1,z_a_1 = base_to_arm(x_b-0.012,y_b+0.003,z_b+0.05)
+    move(x_a_1, y_a_1, z_a_1)
+    time.sleep(0.5)
+    x_a_2, y_a_2, z_a_2 = base_to_arm(x_b-0.012,y_b+0.003,z_b-0.01)
+    move2(x_a_2, y_a_2, z_a_2)
+    time.sleep(0.5)
+    if not hit():
+        x_a_3, y_a_3, z_a_3 = base_to_arm(x_b,y_b,z_b-0.02)
+        move(x_a_1, y_a_1, z_a_1)
+        time.sleep(0.5)
+        move2(x_a_3, y_a_3, z_a_3)
+    pump(1)
+    time.sleep(1)
+    x_c,y_c,z_c = base_to_arm(0.155,0,0.096)
+    move(x_c,y_c,z_c)
+    time.sleep(4)
+    global success 
+    success = camera_check()
+    if success == True:
+        move(0,0.15,0.08)
+    else:
+        move(x_a_1, y_a_1, z_a_1)
+        time.sleep(0.5)
+        x_b, y_b =change_coord(x_b,y_b,0.01)
+        xnew, ynew, znew = base_to_arm(x_b,y_b,z_b-0.02)
+        move2(xnew, ynew, znew)
+        time.sleep(0.5)
+        pump(1)
+        time.sleep(1)
+        x_c,y_c,z_c = base_to_arm(0.155,0,0.096)
+        move(x_c,y_c,z_c)
+        time.sleep(4)
+        success = camera_check()
+        if success == True:
+            move(0,0.15,0.08)
+        else:
+            move(x_a_1, y_a_1, z_a_1)
+            time.sleep(0.5)
+            x_b, y_b =change_coord(x_b,y_b,0.02)
+            xnew, ynew, znew = base_to_arm(x_b-0.012,y_b+0.003,z_b-0.02)
+            move2(xnew, ynew, znew)
+            time.sleep(0.5)
+            pump(1)
+            time.sleep(1)
+            x_c,y_c,z_c = base_to_arm(0.155,0,0.096)
+            move(x_c,y_c,z_c)
+            time.sleep(4)
+            success = camera_check()
+            move(0,0.15,0.08)
+        
+def take_boobie(x,y,z):
+    move(x,y,z)
+    time.sleep(0.5)
+    move(x,y,z-0.03)
+    pump(1)
+    time.sleep(1)
+    move2(0,0.13,0.19) 
+
+def leave_boobie():
+    move2(-0.017,0.26,-0.01)
+    time.sleep(1)
+    pump(0)
+    time.sleep(1)
+    x2,y2,z2 = arm_to_base(0.017,0.26,0.01)
+    x2,y2,z2 = base_to_arm(x2,y2,z2+0.02)
+    move2(x2,y2,z2)
+    time.sleep(1)
+    move(0,0.13,0.19)
+
+def put_down():
+    move(-0.017,0.26,-0.01)
+    time.sleep(0.5)
+    pump(0)
+    move(0,0.15,0.08)
+    
+
+def hit():
+    return karm._uarm.read_digital(pyuarm.BUTTON_D2, pyuarm.PULL_UP) == 0
+
+def arm_to_base(x,y,z):
+    p=PointStamped()
+    p.header = Header()
+    p.header.frame_id = 'arm_coords_origin'
+    p.point.x = x
+    p.point.y = y
+    p.point.z = z        
+    p1 = tf_buffer.transform(p, 'base').point
+    return p1.x, p1.y, p1.z
+
+def base_to_arm(x,y,z):
+    p=PointStamped()
+    p.header = Header()
+    p.header.frame_id = 'base'
+    p.point.x = x
+    p.point.y = y
+    p.point.z = z        
+    p1 = tf_buffer.transform(p, 'arm_coords_origin').point
+    return p1.x, p1.y, p1.z
+
+import logging, logcolor
+logcolor.basic_config(level=logging.INFO)
+
+#check = eyes_to_arm()
+##x,y,z = base_to_arm(0.13,0,0.325)
+#
+#while not rospy.is_shutdown():
+#    try:
+#        update_tf()
+#        while L:
+#            what, args = L.pop(0)
+#            eval(what)(*args)
+#    except:
+#        karm.detach_all_servos()
+#        raise
+#
+#    rate.sleep()
+
+if __name__ == "__main__":
+    arm_take()
+
+karm.detach_all_servos()

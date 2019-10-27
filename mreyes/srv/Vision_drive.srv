@@ -1,0 +1,6 @@
+bool input
+---
+string the_object_id
+float32 object_x
+float32 object_y
+float32 object_z

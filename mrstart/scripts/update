@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+rosrun robot_upstart install --interface wlan1 --job mrrobot-base mrstart/launch/base.launch
+rosrun robot_upstart install --interface wlan1 --job mrrobot-eyes mreyes/launch/eyes.launch
+rosrun robot_upstart install --interface wlan1 --job mrrobot-scan mrscan/launch/scan.launch
+rosrun robot_upstart install --interface wlan1 --job mrrobot-arm mrarm/launch/arm.launch
+rosrun robot_upstart install --interface wlan1 --job mrrobot-particle mrparticle/launch/particle.launch
+echo;echo All done

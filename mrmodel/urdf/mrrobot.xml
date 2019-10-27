@@ -1,0 +1,193 @@
+<?xml version="1.0"?>
+<robot  xmlns:xacro="http://www.ros.org/wiki/xacro" name="test_robot">
+
+  <link name="base">
+    <visual>
+      <geometry>
+        <box size="0.205 .205 .10"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0.035"/>
+	<material name="rgb">
+	<color rgba="0 1.0 1.0 1.0"/>
+	</material>
+    </visual>
+  </link>
+
+  <link name="pillar">
+    <visual>
+      <geometry>
+        <cylinder length="0.2" radius="0.02"/>
+      </geometry>
+	<origin rpy="1.57075 0 1.57075" xyz="0 0 0"/>
+    </visual>
+  </link>
+
+  <link name="laser">
+    <visual>
+      <geometry>
+        <cylinder length="0.05" radius="0.08"/>
+      </geometry>
+	<origin rpy="0 0 0" xyz="0 0 0"/>
+	<material name="green">
+		<color rgba="0 1.0 0 1.0"/>
+	</material>
+    </visual>
+  </link>
+  <joint name="roof_to_laser" type="fixed">
+    <axis rpy="0 0 0" xyz="0 0 1"/>
+    <parent link="roof"/>
+    <child link="laser"/>
+    <origin rpy="0 3.14 1.427" xyz="-0.1 0 -0.025"/>
+  </joint>
+
+
+<link name="left_wheel">
+    <visual>
+      <origin rpy="1.57075 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.01" radius="0.035"/>
+      </geometry>
+      <material name="orange"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="left_wheel_joint" type="fixed">
+    <axis rpy="0 0 0" xyz="0 1 0"/>
+    <parent link="base"/>
+    <child link="left_wheel"/>
+    <origin rpy="0 0 0" xyz="0 0.11 0.0175"/>
+</joint>
+
+<link name="right_wheel">
+    <visual>
+      <origin rpy="1.57075 0 0" xyz="0 0 0"/>
+      <geometry>
+        <cylinder length="0.01" radius="0.035"/>
+      </geometry>
+      <material name="orange"/>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="right_wheel_joint" type="fixed">
+    <axis rpy="0 0 0" xyz="0 1 0"/>
+    <parent link="base"/>
+    <child link="right_wheel"/>
+    <origin rpy="0 0 0" xyz="0 -0.11 0.0175"/>
+</joint>
+
+  <link name="Spillar1">
+    <visual>
+      <geometry>
+        <cylinder length="0.06" radius="0.01"/>
+      </geometry>
+	<origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="base_to_Spillar1" type="fixed">
+    <parent link="base"/>
+    <child link="Spillar1"/>
+    <origin xyz="0.1 0.1 .15"/>
+  </joint>
+
+  <link name="Spillar2">
+    <visual>
+      <geometry>
+        <cylinder length="0.06" radius="0.01"/>
+      </geometry>
+	<origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="base_to_Spillar2" type="fixed">
+    <parent link="base"/>
+    <child link="Spillar2"/>
+    <origin xyz="-0.1 -0.1 .15"/>
+  </joint>
+
+  <link name="Spillar3">
+    <visual>
+      <geometry>
+        <cylinder length="0.06" radius="0.01"/>
+      </geometry>
+	<origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="base_to_Spillar3" type="fixed">
+    <parent link="base"/>
+    <child link="Spillar3"/>
+    <origin xyz="0.1 -0.1 .15"/>
+  </joint>
+
+  <link name="Spillar4">
+    <visual>
+      <geometry>
+        <cylinder length="0.06" radius="0.01"/>
+      </geometry>
+	<origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+  <joint name="base_to_Spillar4" type="fixed">
+    <parent link="base"/>
+    <child link="Spillar4"/>
+    <origin xyz="-0.1 0.1 .15"/>
+  </joint>
+
+  <link name="roof">
+    <visual>
+      <geometry>
+        <box size="0.205 .205 .01"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+    </visual>
+  </link>
+
+  <joint name="base_to_roof" type="fixed">
+    <parent link="base"/>
+    <child link="roof"/>
+    <origin xyz="0 0 .16"/>
+  </joint>
+
+ <link name="camera">
+    <visual>
+      <geometry>
+        <box size=".125 .03 .075"/>
+      </geometry>
+      <origin rpy="0 0 0" xyz="0 0 0"/>
+	<material name="black">
+	<color rgba="0.0 0.0 0.0 1.0"/>
+	</material>
+    </visual>
+  </link>
+  <joint name="roof_to_camera" type="fixed">
+    <parent link="roof"/>
+    <child link="camera"/>
+    <origin rpy="0 0.5 0.10" xyz="0.105 0.00 -0.03"/>
+  </joint>
+
+  <link name="camera_link"/>
+  <joint name="camera_to_camera_link" type="fixed">
+    <parent link="camera"/>
+    <child link="camera_link"/>
+  </joint>
+
+  <joint name="base_to_pillar" type="fixed">
+    <parent link="base"/>
+    <child link="pillar"/>
+    <origin xyz="0.15 0 0.04"/>
+  </joint>
+
+  <joint name="roof_to_armbase" type="fixed">
+    <parent link="roof"/>
+    <child link="arm_base"/>
+    <origin rpy="0 0 3.58" xyz="0 0 0"/>
+  </joint>
+
+  <link name="arm_base" />
+
+  <link name="arm_coords_origin" />
+  <joint name="arm_coords_to_arm_base" type="fixed">
+    <parent link="arm_base"/>
+    <child link="arm_coords_origin"/>
+    <origin rpy="0 0 1.155" xyz="0 0 -0.03"/>
+  </joint>
+
+</robot>
